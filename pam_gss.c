@@ -14,8 +14,8 @@
  *    documentation and/or other materials provided with the distribution.
  *
  * 3. Redistributions in any form must be accompanied by information on
- *    how to obtain complete source code for the NegoEx software and any
- *    accompanying software that uses the NegoEx software. The source code
+ *    how to obtain complete source code for the pam_gss software and any
+ *    accompanying software that uses the pam_gss software. The source code
  *    must either be included in the distribution or be available for no
  *    more than the cost of distribution plus a nominal fee, and must be
  *    freely redistributable under reasonable conditions. For an

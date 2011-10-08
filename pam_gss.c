@@ -50,7 +50,9 @@
 #include <security/pam_appl.h>
 
 #include <gssapi/gssapi.h>
+#ifndef HAVE_HEIMDAL_VERSION
 #include <gssapi/gssapi_ext.h>
+#endif
 
 #include <sys/param.h>
 

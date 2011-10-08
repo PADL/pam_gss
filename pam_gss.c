@@ -228,6 +228,7 @@ static int
 pamGssInitAcceptSecContext(pam_handle_t *pamh,
                            int confFlags,
                            gss_cred_id_t cred,
+                           gss_cred_id_t acceptorCred,
                            gss_name_t hostName,
                            gss_OID mech)
 {
@@ -252,7 +253,7 @@ pamGssInitAcceptSecContext(pam_handle_t *pamh,
         BAIL_ON_GSS_ERROR(major, minor);
 
         if (initiatorToken.length != 0) {
-            major = gss_accept_sec_context(&minor, &acceptorContext, GSS_C_NO_CREDENTIAL,
+            major = gss_accept_sec_context(&minor, &acceptorContext, acceptorCred,
                                            &initiatorToken, GSS_C_NO_CHANNEL_BINDINGS,
                                            &canonUserName, &canonMech, &acceptorToken,
                                            NULL, NULL, NULL);
@@ -428,8 +429,10 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
     gss_buffer_desc passwordBuf = GSS_C_EMPTY_BUFFER;
     gss_name_t userName = GSS_C_NO_NAME;
     gss_name_t hostName = GSS_C_NO_NAME;
-    gss_cred_id_t cred = GSS_C_NO_CREDENTIAL;
+    gss_cred_id_t initiatorCred = GSS_C_NO_CREDENTIAL;
+    gss_cred_id_t acceptorCred = GSS_C_NO_CREDENTIAL;
     gss_OID mech = &gss_spnego_mechanism_oid_desc;
+    gss_OID_set_desc mechOids;
 
     confFlags = readConfFlags(argc, argv);
 
@@ -458,15 +461,24 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
     major = gss_import_name(&minor, &hostNameBuf, GSS_C_NT_HOSTBASED_SERVICE, &hostName);
     BAIL_ON_GSS_ERROR(major, minor);
 
+    mechOids.count = 1;
+    mechOids.elements = mech;
+
+    major = gss_acquire_cred(&minor, hostName, GSS_C_INDEFINITE, &mechOids,
+                             GSS_C_ACCEPT, &acceptorCred, NULL, NULL);
+    BAIL_ON_GSS_ERROR(major, minor);
+
     status = PAM_AUTHINFO_UNAVAIL;
 
     if (confFlags & (FLAG_USE_FIRST_PASS | FLAG_TRY_FIRST_PASS)) {
         status = pam_get_item(pamh, PAM_AUTHTOK, (void *)&passwordBuf.value);
         BAIL_ON_PAM_ERROR(status);
 
-        status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf, mech, &cred);
+        status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf,
+                                   mech, &initiatorCred);
         if (status == PAM_SUCCESS)
-            status = pamGssInitAcceptSecContext(pamh, confFlags, cred, hostName, mech);
+            status = pamGssInitAcceptSecContext(pamh, confFlags, initiatorCred,
+                                                acceptorCred, hostName, mech);
         if (confFlags & FLAG_USE_FIRST_PASS)
             BAIL_ON_PAM_ERROR(status);
     }
@@ -477,23 +489,26 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
         status = pamGssGetAuthTok(pamh, confFlags, &passwordBuf);
         BAIL_ON_PAM_ERROR(status);
 
-        gss_release_cred(&minor, &cred);
+        gss_release_cred(&minor, &initiatorCred);
 
-        status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf, mech, &cred);
+        status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf,
+                                   mech, &initiatorCred);
         if (status == PAM_SUCCESS)
-            status = pamGssInitAcceptSecContext(pamh, confFlags, cred, hostName, mech);
+            status = pamGssInitAcceptSecContext(pamh, confFlags, initiatorCred,
+                                                acceptorCred, hostName, mech);
         BAIL_ON_PAM_ERROR(status);
     }
 
-    status = pam_set_data(pamh, GSS_CRED_DATA, cred, pamGssCleanupCred);
+    status = pam_set_data(pamh, GSS_CRED_DATA, initiatorCred, pamGssCleanupCred);
     BAIL_ON_PAM_ERROR(status);
 
-    cred = GSS_C_NO_CREDENTIAL;
+    initiatorCred = GSS_C_NO_CREDENTIAL;
 
 cleanup:
     gss_release_name(&minor, &userName);
     gss_release_name(&minor, &hostName);
-    gss_release_cred(&minor, &cred);
+    gss_release_cred(&minor, &initiatorCred);
+    gss_release_cred(&minor, &acceptorCred);
 #if 0
     if (mech != &gss_spnego_mechanism_oid_desc)
         gss_release_oid(&minor, &mech);

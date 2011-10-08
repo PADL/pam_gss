@@ -37,6 +37,12 @@
  * THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * This is a PAM module that wraps around GSS mechanisms that support
+ * gss_acquire_cred_with_password. The default mechanism is SPNEGO, but
+ * this can be configured with the mech=OID option in pam.conf.
+ */
+
 #define PAM_SM_AUTH 
 #define PAM_SM_ACCOUNT 
 
@@ -53,14 +59,39 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <syslog.h>
-
-#define HAVE_GSS_LOCALNAME      1
+#include <assert.h>
 
 #define PASSWORD_PROMPT         "Password:"
 
 #define GSS_MECH_DATA           "GSS-MECH-DATA"
 #define GSS_CRED_DATA           "GSS-CRED-DATA"
 #define GSS_NAME_DATA           "GSS-NAME-DATA"
+
+#define BAIL_ON_PAM_ERROR(status)           do {            \
+        if ((status) != PAM_SUCCESS)                        \
+            goto cleanup;                                   \
+    } while (0)
+
+#define BAIL_ON_GSS_ERROR(major, minor)     do {            \
+            status = pamGssMapStatus((major), (minor));     \
+        if (GSS_ERROR(major)) {                             \
+            goto cleanup;                                   \
+        }                                                   \
+    } while (0)
+
+#define FLAG_USE_FIRST_PASS             0x01
+#define FLAG_TRY_FIRST_PASS             0x02
+#define FLAG_IGNORE_UNKNOWN_USER        0x04
+#define FLAG_IGNORE_AUTHINFO_UNAVAIL    0x08
+#define FLAG_NO_WARN                    0x10
+#define FLAG_NULLOK                     0x20
+#define FLAG_DEBUG                      0x30
+
+#define IGNORE_ERR_P(status, confFlags)                                                     \
+    (                                                                                       \
+        ((status) == PAM_USER_UNKNOWN && ((confFlags) & FLAG_IGNORE_UNKNOWN_USER)) ||       \
+        ((status) == PAM_AUTHINFO_UNAVAIL && ((confFlags) & FLAG_IGNORE_AUTHINFO_UNAVAIL))  \
+    )
 
 static gss_OID_desc gss_spnego_mechanism_oid_desc =
         {6, (void *)"\x2b\x06\x01\x05\x05\x02"};
@@ -95,7 +126,7 @@ displayStatus(OM_uint32 major, OM_uint32 minor)
 }
 
 static int
-gssToPamStatus(OM_uint32 major, OM_uint32 minor)
+pamGssMapStatus(OM_uint32 major, OM_uint32 minor)
 {
     int status;
 
@@ -103,15 +134,37 @@ gssToPamStatus(OM_uint32 major, OM_uint32 minor)
     case GSS_S_COMPLETE:
         status = PAM_SUCCESS;
         break;
-    case GSS_S_BAD_NAME:
+    case GSS_S_BAD_MECH:
         status = PAM_USER_UNKNOWN;
         break;
     case GSS_S_UNAUTHORIZED:
         status = PAM_PERM_DENIED;
         break;
+    case GSS_S_NO_CRED:
+#if 0
+    case GSS_S_CRED_UNAVAIL:
+#endif
+        status = PAM_CRED_UNAVAIL;
+        break;
     case GSS_S_DEFECTIVE_CREDENTIAL:
-    default:
         status = PAM_AUTH_ERR;
+        break;
+    case GSS_S_CREDENTIALS_EXPIRED:
+        status = PAM_CRED_EXPIRED;
+        break;
+    case GSS_S_UNAVAILABLE:
+        status = PAM_IGNORE;
+        break;
+    case GSS_S_CONTEXT_EXPIRED:
+    case GSS_S_BAD_NAME:
+    case GSS_S_BAD_NAMETYPE:
+    case GSS_S_BAD_BINDINGS:
+    case GSS_S_BAD_STATUS:
+    case GSS_S_NO_CONTEXT:
+    case GSS_S_DEFECTIVE_TOKEN:
+    case GSS_S_FAILURE:
+    case GSS_S_BAD_QOP:
+        status = PAM_SERVICE_ERR;
         break;
     }
 
@@ -119,128 +172,81 @@ gssToPamStatus(OM_uint32 major, OM_uint32 minor)
 }
 
 static void
-cleanupGssMechData(pam_handle_t *pamh, void *data,
-                   int error_status)
+pamGssCleanupMech(pam_handle_t *pamh, void *data, int error_status)
 {
+#ifndef HAVE_HEIMDAL_VERSION
     OM_uint32 minor;
+
     gss_release_oid(&minor, (gss_OID *)&data);
+#endif
 }
 
 static void
-cleanupGssCredData(pam_handle_t *pamh, void *data,
-                   int error_status)
+pamGssCleanupCred(pam_handle_t *pamh, void *data, int error_status)
 {
     OM_uint32 minor;
+
     gss_release_cred(&minor, (gss_cred_id_t *)&data);
 }
 
 static void
-cleanupGssNameData(pam_handle_t *pamh, void *data,
-                   int error_status)
+pamGssCleanupName(pam_handle_t *pamh, void *data, int error_status)
 {
     OM_uint32 minor;
+
     gss_release_name(&minor, (gss_name_t *)&data);
 }
 
-int
-pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
+static int
+readConfFlags(int argc, const char **argv)
+{
+    int i, confFlags = 0;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "use_first_pass") == 0)
+            confFlags |= FLAG_USE_FIRST_PASS;
+        else if (strcmp(argv[i], "try_first_pass") == 0)
+            confFlags |= FLAG_TRY_FIRST_PASS;
+        else if (strcmp(argv[i], "ignore_unknown_user") == 0)
+            confFlags |= FLAG_IGNORE_UNKNOWN_USER;
+        else if (strcmp(argv[i], "ignore_authinfo_unavail") == 0)
+            confFlags |= FLAG_IGNORE_AUTHINFO_UNAVAIL;
+        else if (strcmp(argv[i], "no_warn") == 0)
+            confFlags |= FLAG_NO_WARN;
+        else if (strcmp(argv[i], "nullok") == 0)
+            confFlags |= FLAG_NULLOK;
+        else if (strcmp(argv[i], "debug") == 0)
+            confFlags |= FLAG_DEBUG;
+    }
+
+    return confFlags;
+}
+
+static int
+pamGssInitAcceptSecContext(pam_handle_t *pamh,
+                           int confFlags,
+                           gss_cred_id_t cred,
+                           gss_name_t hostName,
+                           gss_OID mech)
 {
     int status;
-    struct pam_conv *conv;
-    struct pam_message msg;
-    const struct pam_message *msgp;
-    struct pam_response *resp;
-
-    OM_uint32 major = GSS_S_FAILURE, minor;
-    gss_buffer_desc userNameBuf = GSS_C_EMPTY_BUFFER;
-    gss_buffer_desc hostNameBuf = GSS_C_EMPTY_BUFFER;
-    gss_buffer_desc passwordBuf = GSS_C_EMPTY_BUFFER;
-    gss_buffer_desc canonUserNameBuf = GSS_C_EMPTY_BUFFER;
-    gss_name_t userName = GSS_C_NO_NAME;
-    gss_name_t hostName = GSS_C_NO_NAME;
-    gss_name_t canonUserName = GSS_C_NO_NAME;
-    gss_OID_set_desc mechOids = { 1, &gss_spnego_mechanism_oid_desc };
-    gss_cred_id_t cred = GSS_C_NO_CREDENTIAL;
+    OM_uint32 major, minor;
     gss_buffer_desc initiatorToken = GSS_C_EMPTY_BUFFER;
     gss_buffer_desc acceptorToken = GSS_C_EMPTY_BUFFER;
     gss_ctx_id_t initiatorContext = GSS_C_NO_CONTEXT;
     gss_ctx_id_t acceptorContext = GSS_C_NO_CONTEXT;
+    gss_buffer_desc canonUserNameBuf = GSS_C_EMPTY_BUFFER;
+    gss_name_t canonUserName = GSS_C_NO_NAME;
     gss_OID canonMech = GSS_C_NO_OID;
-    char hostNameBufBuf[5 + MAXHOSTNAMELEN + 1] = "host@";
-    int passwordBufAlloced = 0;
-
-    status = pam_get_user(pamh, (void *)&userNameBuf.value, NULL);
-    if (status != PAM_SUCCESS) {
-        goto cleanup;
-    }
-
-    userNameBuf.length = strlen((char *)userNameBuf.value);
-
-    major = gss_import_name(&minor, &userNameBuf, GSS_C_NT_USER_NAME, &userName);
-    if (GSS_ERROR(major))
-        goto cleanup;
-
-    if (gethostname(&hostNameBufBuf[5], MAXHOSTNAMELEN) != 0) {
-        major = GSS_S_FAILURE;
-        minor = errno;
-        goto cleanup;
-    }
-
-    hostNameBuf.length = strlen(hostNameBufBuf);
-    hostNameBuf.value = hostNameBufBuf;
-
-    major = gss_import_name(&minor, &hostNameBuf, GSS_C_NT_HOSTBASED_SERVICE, &hostName);
-    if (GSS_ERROR(major))
-        goto cleanup;
-
-    status = pam_get_item(pamh, PAM_AUTHTOK, (void *)&passwordBuf.value);
-    if (status != PAM_SUCCESS) {
-        goto cleanup;
-    }
-
-    if (passwordBuf.value == NULL) {
-        status = pam_get_item(pamh, PAM_CONV, (const void **)&conv);
-        if (status != PAM_SUCCESS)
-            goto cleanup;
-
-        msg.msg_style = PAM_PROMPT_ECHO_OFF;
-        msg.msg = PASSWORD_PROMPT;
-        msgp = &msg;
-        resp = NULL;
-
-        status = (*conv->conv)(1, &msgp, &resp, conv->appdata_ptr);
-
-        if (resp != NULL) {
-            if (status == PAM_SUCCESS) {
-                passwordBufAlloced++;
-                passwordBuf.value = resp->resp;
-            } else
-                free(resp->resp);
-            free(resp);
-        }
-    }
-
-    passwordBuf.length = passwordBuf.value ? strlen((char *)passwordBuf.value) : 0;
-    if (passwordBuf.length == 0 && (flags & PAM_DISALLOW_NULL_AUTHTOK)) {
-        status = PAM_AUTH_ERR;
-        goto cleanup;
-    }
-
-    major = gss_acquire_cred_with_password(&minor, userName, &passwordBuf,
-                                           GSS_C_INDEFINITE, &mechOids,
-                                           GSS_C_INITIATE, &cred, NULL, NULL);
-    if (GSS_ERROR(major))
-        goto cleanup;
 
     do {
         major = gss_init_sec_context(&minor, cred, &initiatorContext,
-                                     hostName, &mechOids.elements[0], GSS_C_MUTUAL_FLAG,
+                                     hostName, mech, GSS_C_MUTUAL_FLAG,
                                      GSS_C_INDEFINITE, GSS_C_NO_CHANNEL_BINDINGS,
                                      &acceptorToken, NULL, &initiatorToken, NULL, NULL);
-        if (GSS_ERROR(major))
-            break;
-
         gss_release_buffer(&minor, &acceptorToken);
+
+        BAIL_ON_GSS_ERROR(major, minor);
 
         major = gss_accept_sec_context(&minor, &acceptorContext, GSS_C_NO_CREDENTIAL,
                                        &initiatorToken, GSS_C_NO_CHANNEL_BINDINGS,
@@ -248,56 +254,245 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
                                        NULL, NULL, NULL);
 
         gss_release_buffer(&minor, &initiatorToken);
+
+        BAIL_ON_GSS_ERROR(major, minor);
     } while (major == GSS_S_CONTINUE_NEEDED);
 
-    if (GSS_ERROR(major))
-        goto cleanup;
+    BAIL_ON_GSS_ERROR(major, minor);
 
-#ifdef HAVE_GSS_LOCALNAME
     major = gss_localname(&minor, canonUserName, GSS_C_NO_OID, &canonUserNameBuf);
     if (major == GSS_S_COMPLETE) {
         status = pam_set_item(pamh, PAM_USER, canonUserNameBuf.value);
-        if (status != PAM_SUCCESS)
-            goto cleanup;
-    }
-#endif
-
-    status = pam_set_data(pamh, GSS_CRED_DATA, cred, cleanupGssCredData);
-    if (status != PAM_SUCCESS)
+        BAIL_ON_PAM_ERROR(status);
+    } else if (major != GSS_S_UNAVAILABLE)
         goto cleanup;
-    cred = GSS_C_NO_CREDENTIAL;
 
-    status = pam_set_data(pamh, GSS_NAME_DATA, canonUserName, cleanupGssNameData);
-    if (status != PAM_SUCCESS)
-        goto cleanup;
+    status = pam_set_data(pamh, GSS_NAME_DATA, canonUserName, pamGssCleanupName);
+    BAIL_ON_PAM_ERROR(status);
+
     canonUserName = GSS_C_NO_NAME;
 
-    status = pam_set_data(pamh, GSS_MECH_DATA, canonMech, cleanupGssMechData);
-    if (status != PAM_SUCCESS)
-        goto cleanup;
+    status = pam_set_data(pamh, GSS_MECH_DATA, canonMech, pamGssCleanupMech);
+    BAIL_ON_PAM_ERROR(status);
+
     canonMech = GSS_C_NO_OID;
 
     status = PAM_SUCCESS;
 
 cleanup:
-    if (status == PAM_SUCCESS) {
-        status = gssToPamStatus(major, minor);
-        displayStatus(major, minor);
-    }
-
-    gss_release_name(&minor, &userName);
     gss_release_name(&minor, &canonUserName);
-    gss_release_name(&minor, &hostName);
-    gss_release_cred(&minor, &cred);
     gss_release_buffer(&minor, &initiatorToken);
     gss_release_buffer(&minor, &acceptorToken);
-    gss_release_buffer(&minor, &canonUserNameBuf);
-    if (passwordBufAlloced) {
-        memset(passwordBuf.value, 0, passwordBuf.length);
-        gss_release_buffer(&minor, &passwordBuf);
-    }
     gss_delete_sec_context(&minor, &initiatorContext, NULL);
     gss_delete_sec_context(&minor, &acceptorContext, NULL);
+    gss_release_buffer(&minor, &canonUserNameBuf);
+
+    if (IGNORE_ERR_P(status, confFlags))
+        status = PAM_IGNORE;
+
+    return status;
+}
+
+static int
+pamGssAcquireCred(pam_handle_t *pamh,
+                  int confFlags,
+                  gss_name_t userName,
+                  gss_buffer_t passwordBuf,
+                  gss_OID mech,
+                  gss_cred_id_t *cred)
+{
+    int status;
+    OM_uint32 major, minor;
+    gss_OID_set_desc mechOids;
+
+    mechOids.count = 1;
+    mechOids.elements = mech;
+
+    major = gss_acquire_cred_with_password(&minor, userName, passwordBuf,
+                                           GSS_C_INDEFINITE, &mechOids,
+                                           GSS_C_INITIATE, cred, NULL, NULL);
+    BAIL_ON_GSS_ERROR(major, minor);
+
+    status = PAM_SUCCESS;
+
+cleanup:
+    return status;
+}
+
+static int
+pamGssGetAuthTok(pam_handle_t *pamh,
+                 int confFlags,
+                 gss_buffer_t passwordBuf)
+{
+    int status;
+    struct pam_conv *conv;
+    struct pam_message msg;
+    const struct pam_message *msgp;
+    struct pam_response *resp;
+
+    status = pam_get_item(pamh, PAM_CONV, (const void **)&conv);
+    BAIL_ON_PAM_ERROR(status);
+
+    msg.msg_style = PAM_PROMPT_ECHO_OFF;
+    msg.msg = PASSWORD_PROMPT;
+    msgp = &msg;
+    resp = NULL;
+
+    status = (*conv->conv)(1, &msgp, &resp, conv->appdata_ptr);
+
+    if (resp != NULL) {
+        if (status == PAM_SUCCESS)
+            passwordBuf->value = resp->resp;
+        else
+            free(resp->resp);
+        free(resp);
+    }
+
+    passwordBuf->length = passwordBuf->value ? strlen((char *)passwordBuf->value) : 0;
+    if (passwordBuf->length == 0 && (confFlags & FLAG_NULLOK) == 0) {
+        status = PAM_AUTH_ERR;
+        goto cleanup;
+    }
+
+cleanup:
+    return status;
+}
+
+static int
+readConfMechOid(int argc,
+                const char **argv,
+                gss_OID *mech)
+{
+    int i;
+    OM_uint32 major, minor;
+    gss_buffer_desc oidBuf;
+    const char *oidstr = NULL;
+    size_t oidstrLen;
+    char *p;
+
+    for (i = 0; i < argc; i++) {
+        if (strncmp(argv[i], "mech=", 5) != 0)
+            continue;
+
+        oidstr = &argv[i][5];
+        break;
+    }
+
+    if (oidstr == NULL)
+        return PAM_SUCCESS;
+
+    oidstrLen = strlen(oidstr);
+
+    oidBuf.length = 2 + oidstrLen + 2;
+    oidBuf.value = malloc(oidBuf.length + 1);
+    if (oidBuf.value == NULL)
+        return PAM_BUF_ERR;
+
+    p = (char *)oidBuf.value;
+    *p++ = '{';
+    *p++ = ' ';
+    for (i = 0; i < oidstrLen; i++)
+        *p++ = oidstr[i] == '.' ? ' ' : oidstr[i];
+    *p++ = ' ';
+    *p++ = '}';
+    *p = '\0';
+
+    assert(oidBuf.length == p - (char *)oidBuf.value);
+
+    major = gss_str_to_oid(&minor, &oidBuf, mech);
+
+    free(oidBuf.value);
+
+    return pamGssMapStatus(major, minor);
+}
+
+int
+pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
+{
+    int status, confFlags = 0;
+    char hostNameBufBuf[5 + MAXHOSTNAMELEN + 1] = "host@";
+    int isConvPasswordBuf = 0;
+
+    OM_uint32 major, minor;
+    gss_buffer_desc userNameBuf = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc hostNameBuf = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc passwordBuf = GSS_C_EMPTY_BUFFER;
+    gss_name_t userName = GSS_C_NO_NAME;
+    gss_name_t hostName = GSS_C_NO_NAME;
+    gss_cred_id_t cred = GSS_C_NO_CREDENTIAL;
+    gss_OID mech = &gss_spnego_mechanism_oid_desc;
+
+    confFlags = readConfFlags(argc, argv);
+
+    status = readConfMechOid(argc, argv, &mech);
+    BAIL_ON_PAM_ERROR(status);
+
+    if (flags & PAM_DISALLOW_NULL_AUTHTOK)
+        confFlags &= ~(FLAG_NULLOK);
+
+    status = pam_get_user(pamh, (void *)&userNameBuf.value, NULL);
+    BAIL_ON_PAM_ERROR(status);
+
+    userNameBuf.length = strlen((char *)userNameBuf.value);
+
+    major = gss_import_name(&minor, &userNameBuf, GSS_C_NT_USER_NAME, &userName);
+    BAIL_ON_GSS_ERROR(major, minor);
+
+    if (gethostname(&hostNameBufBuf[5], MAXHOSTNAMELEN) != 0) {
+        status = PAM_SYSTEM_ERR;
+        goto cleanup;
+    }
+
+    hostNameBuf.length = strlen(hostNameBufBuf);
+    hostNameBuf.value = hostNameBufBuf;
+
+    major = gss_import_name(&minor, &hostNameBuf, GSS_C_NT_HOSTBASED_SERVICE, &hostName);
+    BAIL_ON_GSS_ERROR(major, minor);
+
+    status = PAM_AUTHINFO_UNAVAIL;
+
+    if (confFlags & (FLAG_USE_FIRST_PASS | FLAG_TRY_FIRST_PASS)) {
+        status = pam_get_item(pamh, PAM_AUTHTOK, (void *)&passwordBuf.value);
+        BAIL_ON_PAM_ERROR(status);
+
+        status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf, mech, &cred);
+        if (status == PAM_SUCCESS)
+            status = pamGssInitAcceptSecContext(pamh, confFlags, cred, hostName, mech);
+        if (confFlags & FLAG_USE_FIRST_PASS)
+            BAIL_ON_PAM_ERROR(status);
+    }
+
+    if (status != PAM_SUCCESS) {
+        isConvPasswordBuf = 1;
+
+        status = pamGssGetAuthTok(pamh, confFlags, &passwordBuf);
+        BAIL_ON_PAM_ERROR(status);
+
+        gss_release_cred(&minor, &cred);
+
+        status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf, mech, &cred);
+        if (status == PAM_SUCCESS)
+            status = pamGssInitAcceptSecContext(pamh, confFlags, cred, hostName, mech);
+        BAIL_ON_PAM_ERROR(status);
+    }
+
+    status = pam_set_data(pamh, GSS_CRED_DATA, cred, pamGssCleanupCred);
+    BAIL_ON_PAM_ERROR(status);
+
+    cred = GSS_C_NO_CREDENTIAL;
+
+cleanup:
+    gss_release_name(&minor, &userName);
+    gss_release_name(&minor, &hostName);
+    gss_release_cred(&minor, &cred);
+#if 0
+    if (mech != &gss_spnego_mechanism_oid_desc)
+        gss_release_oid(&minor, &mech);
+#endif
+    if (isConvPasswordBuf) {
+        memset((char *)passwordBuf.value, 0, passwordBuf.length);
+        free(passwordBuf.value);
+    }
 
     return status;
 }
@@ -310,14 +505,12 @@ pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv)
     char *userName = NULL;
 
     status = pam_get_data(pamh, GSS_NAME_DATA, (const void **)&canonUserName);
-    if (status != PAM_SUCCESS) {
+    if (status != PAM_SUCCESS)
         return PAM_USER_UNKNOWN;
-    }
 
     status = pam_get_user(pamh, (void *)&userName, NULL);
-    if (status != PAM_SUCCESS) {
+    if (status != PAM_SUCCESS)
         return PAM_USER_UNKNOWN;
-    }
 
     return gss_userok(canonUserName, userName) ? PAM_SUCCESS : PAM_PERM_DENIED;
 
@@ -331,22 +524,19 @@ pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv)
     gss_cred_id_t cred = GSS_C_NO_CREDENTIAL;
     gss_OID mech = GSS_C_NO_OID;
 
-    if (flags && (flags & PAM_ESTABLISH_CRED) == 0) {
+    if (flags && (flags & PAM_ESTABLISH_CRED) == 0)
         return PAM_SUCCESS;
-    }
 
     status = pam_get_data(pamh, GSS_CRED_DATA, (const void **)&cred);
-    if (status != PAM_SUCCESS) {
-        return status;
-    }
+    BAIL_ON_PAM_ERROR(status);
 
     status = pam_get_data(pamh, GSS_MECH_DATA, (const void **)&mech);
-    if (status != PAM_SUCCESS) {
-        return status;
-    }
+    BAIL_ON_PAM_ERROR(status);
 
     major = gss_store_cred(&minor, cred, GSS_C_INITIATE, mech,
                            1, 1, NULL, NULL);
+    BAIL_ON_GSS_ERROR(major, minor);
 
-    return gssToPamStatus(major, minor);
+cleanup:
+    return status;
 }

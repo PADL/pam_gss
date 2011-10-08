@@ -14,7 +14,7 @@ pamtest: pamtest.o
 	cc -o $@ $? $(LDFLAGS)
 
 clean:
-	rm -f pam_gss.o pam_gss.so pamtest pamtest.o
+	rm -f pam_gss.so pamtest *.o
 
 install:
 	cp pam_gss.so /usr/lib/pam

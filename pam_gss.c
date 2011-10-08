@@ -240,27 +240,34 @@ pamGssInitAcceptSecContext(pam_handle_t *pamh,
     gss_buffer_desc canonUserNameBuf = GSS_C_EMPTY_BUFFER;
     gss_name_t canonUserName = GSS_C_NO_NAME;
     gss_OID canonMech = GSS_C_NO_OID;
+    OM_uint32 gssFlags;
 
     do {
         major = gss_init_sec_context(&minor, cred, &initiatorContext,
                                      hostName, mech, GSS_C_MUTUAL_FLAG,
                                      GSS_C_INDEFINITE, GSS_C_NO_CHANNEL_BINDINGS,
-                                     &acceptorToken, NULL, &initiatorToken, NULL, NULL);
+                                     &acceptorToken, NULL, &initiatorToken, &gssFlags, NULL);
         gss_release_buffer(&minor, &acceptorToken);
 
         BAIL_ON_GSS_ERROR(major, minor);
 
-        major = gss_accept_sec_context(&minor, &acceptorContext, GSS_C_NO_CREDENTIAL,
-                                       &initiatorToken, GSS_C_NO_CHANNEL_BINDINGS,
-                                       &canonUserName, &canonMech, &acceptorToken,
-                                       NULL, NULL, NULL);
-
-        gss_release_buffer(&minor, &initiatorToken);
+        if (initiatorToken.length != 0) {
+            major = gss_accept_sec_context(&minor, &acceptorContext, GSS_C_NO_CREDENTIAL,
+                                           &initiatorToken, GSS_C_NO_CHANNEL_BINDINGS,
+                                           &canonUserName, &canonMech, &acceptorToken,
+                                           NULL, NULL, NULL);
+            gss_release_buffer(&minor, &initiatorToken);
+        }
 
         BAIL_ON_GSS_ERROR(major, minor);
     } while (major == GSS_S_CONTINUE_NEEDED);
 
     BAIL_ON_GSS_ERROR(major, minor);
+
+    if ((gssFlags & GSS_C_MUTUAL_FLAG) == 0) {
+        status = PAM_PERM_DENIED;
+        goto cleanup;
+    }
 
     major = gss_localname(&minor, canonUserName, GSS_C_NO_OID, &canonUserNameBuf);
     if (major == GSS_S_COMPLETE) {

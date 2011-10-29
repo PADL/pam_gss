@@ -250,6 +250,13 @@ pamGssInitAcceptSecContext(pam_handle_t *pamh,
                                      &acceptorToken, NULL, &initiatorToken, &gssFlags, NULL);
         gss_release_buffer(&minor, &acceptorToken);
 
+#ifdef GSS_S_PROMPTING_NEEDED
+        if (major == GSS_S_PROMPTING_NEEDED) {
+            status = PAM_CRED_INSUFFICIENT;
+            goto cleanup;
+        }
+#endif
+
         BAIL_ON_GSS_ERROR(major, minor);
 
         if (initiatorToken.length != 0) {

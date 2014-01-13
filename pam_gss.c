@@ -384,7 +384,6 @@ pamGssAcquireAaplInitialCred(pam_handle_t *pamh,
         return PAM_BUF_ERR;
 
     CFDictionaryApplyFunction(attributes, pamGssMapAttribute, (void *)mappedAttrs);
-    CFShow(mappedAttrs);
 
     major = gss_aapl_initial_cred(userName, mech, mappedAttrs, cred, NULL);
 

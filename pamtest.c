@@ -59,8 +59,6 @@
 
 #include <security/pam_appl.h>
 
-static char rcsId[] = "$Id$";
-
 int pamtestConv(int num_msg, struct pam_message **msgv,
 	struct pam_response **respv, void *appdata_ptr)
 {

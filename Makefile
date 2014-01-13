@@ -1,6 +1,12 @@
 KRB5DIR=/usr/local
+
+ifeq ($(wildcard /System/Library/Frameworks/GSS.framework),)
 KRB5CFLAGS=$(shell $(KRB5DIR)/bin/krb5-config gssapi --cflags)
 KRB5LIBS=$(shell $(KRB5DIR)/bin/krb5-config gssapi --libs)
+else
+KRB5CFLAGS=
+KRB5LIBS=-framework GSS -F/System/Library/PrivateFrameworks -framework Heimdal -framework CoreFoundation
+endif
 
 CFLAGS=-Wall -g $(KRB5CFLAGS)
 LDFLAGS=$(KRB5LIBS) -lpam

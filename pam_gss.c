@@ -49,9 +49,14 @@
 #include <security/pam_modules.h>
 #include <security/pam_appl.h>
 
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <GSS/GSS.h>
+#else
 #include <gssapi/gssapi.h>
 #ifndef HAVE_HEIMDAL_VERSION
 #include <gssapi/gssapi_ext.h>
+#endif
 #endif
 
 #include <sys/param.h>
@@ -68,6 +73,10 @@
 #define GSS_MECH_DATA           "GSS-MECH-DATA"
 #define GSS_CRED_DATA           "GSS-CRED-DATA"
 #define GSS_NAME_DATA           "GSS-NAME-DATA"
+
+#ifdef __APPLE__
+#define CREDUI_ATTR_DATA        "CREDUI-ATTR-DATA"
+#endif
 
 #define BAIL_ON_PAM_ERROR(status)           do {            \
         if ((status) != PAM_SUCCESS)                        \
@@ -98,19 +107,36 @@
 static gss_OID_desc gss_spnego_mechanism_oid_desc =
         {6, (void *)"\x2b\x06\x01\x05\x05\x02"};
 
+#ifdef __APPLE__
+typedef struct heim_oid {
+    size_t length;
+    unsigned *components;
+} heim_oid;
+
+int
+der_parse_heim_oid (const char *str, const char *sep, heim_oid *data);
+
+int
+der_put_oid (unsigned char *p, size_t len,
+             const heim_oid *data, size_t *size);
+
+void
+der_free_oid (heim_oid *k);
+#endif
+
 static void
 displayStatusByType(OM_uint32 status, int type)
 {
-    OM_uint32 major, minor;
+    OM_uint32 minor;
     gss_buffer_desc msg;
     OM_uint32 messageCtx;
 
     messageCtx = 0;
 
     for (;;) {
-        major = gss_display_status(&minor, status,
-                                   type, GSS_C_NULL_OID,
-                                   &messageCtx, &msg);
+        gss_display_status(&minor, status,
+                           type, GSS_C_NULL_OID,
+                           &messageCtx, &msg);
         syslog(LOG_DEBUG, "pam_gss: %s\n", (char *)msg.value);
 
         gss_release_buffer(&minor, &msg);
@@ -120,6 +146,7 @@ displayStatusByType(OM_uint32 status, int type)
     }
 }
 
+__attribute__((__unused__))
 static void
 displayStatus(OM_uint32 major, OM_uint32 minor)
 {
@@ -166,6 +193,7 @@ pamGssMapStatus(OM_uint32 major, OM_uint32 minor)
     case GSS_S_DEFECTIVE_TOKEN:
     case GSS_S_FAILURE:
     case GSS_S_BAD_QOP:
+    default:
         status = PAM_SERVICE_ERR;
         break;
     }
@@ -277,12 +305,14 @@ pamGssInitAcceptSecContext(pam_handle_t *pamh,
         goto cleanup;
     }
 
+#ifndef __APPLE__
     major = gss_localname(&minor, canonUserName, GSS_C_NO_OID, &canonUserNameBuf);
     if (major == GSS_S_COMPLETE) {
         status = pam_set_item(pamh, PAM_USER, canonUserNameBuf.value);
         BAIL_ON_PAM_ERROR(status);
     } else if (major != GSS_S_UNAVAILABLE)
         goto cleanup;
+#endif
 
     status = pam_set_data(pamh, GSS_NAME_DATA, canonUserName, pamGssCleanupName);
     BAIL_ON_PAM_ERROR(status);
@@ -310,6 +340,60 @@ cleanup:
     return status;
 }
 
+#ifdef __APPLE__
+static void
+pamGssMapAttribute(const void *key, const void *value, void *context)
+{       
+    CFMutableDictionaryRef mappedAttrs = (CFMutableDictionaryRef)context;
+    CFStringRef mappedKey;
+
+    if (CFEqual(key, CFSTR("kCUIAttrCredentialSecIdentity"))) {
+        mappedKey = CFRetain(kGSSICCertificate);
+    } else {
+        mappedKey = CFStringCreateMutableCopy(kCFAllocatorDefault, 0, (CFStringRef)key);
+        if (mappedKey == NULL)
+            return;
+
+        /* Map CredUI credential to something for gss_aapl_initial_cred */
+        CFStringFindAndReplace((CFMutableStringRef)mappedKey,
+                               CFSTR("kCUIAttrCredential"),
+                               CFSTR("kGSSIC"),
+                               CFRangeMake(0, CFStringGetLength(mappedKey)),
+                               0);
+    }
+
+    CFDictionarySetValue(mappedAttrs, mappedKey, value);
+    CFRelease(mappedKey);
+}
+
+static int
+pamGssAcquireAaplInitialCred(pam_handle_t *pamh,
+                             gss_name_t userName,
+                             gss_OID mech,
+                             CFDictionaryRef attributes,
+                             gss_cred_id_t *cred)
+{
+    CFMutableDictionaryRef mappedAttrs;
+    OM_uint32 major;
+
+    mappedAttrs = CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                            CFDictionaryGetCount(attributes),
+                                            &kCFTypeDictionaryKeyCallBacks,
+                                            &kCFTypeDictionaryValueCallBacks);
+    if (mappedAttrs == NULL)
+        return PAM_BUF_ERR;
+
+    CFDictionaryApplyFunction(attributes, pamGssMapAttribute, (void *)mappedAttrs);
+    CFShow(mappedAttrs);
+
+    major = gss_aapl_initial_cred(userName, mech, mappedAttrs, cred, NULL);
+
+    CFRelease(mappedAttrs);
+
+    return pamGssMapStatus(major, 0);
+}
+#endif /* __APPLE__ */
+
 static int
 pamGssAcquireCred(pam_handle_t *pamh,
                   int confFlags,
@@ -321,6 +405,13 @@ pamGssAcquireCred(pam_handle_t *pamh,
     int status;
     OM_uint32 major, minor;
     gss_OID_set_desc mechOids;
+#ifdef __APPLE__
+    CFDictionaryRef attributes = NULL;
+
+    status = pam_get_data(pamh, CREDUI_ATTR_DATA, (const void **)&attributes);
+    if (status == PAM_SUCCESS)
+        return pamGssAcquireAaplInitialCred(pamh, userName, mech, attributes, cred);
+#endif /* __APPLE__ */
 
     mechOids.count = 1;
     mechOids.elements = mech;
@@ -349,6 +440,11 @@ pamGssGetAuthTok(pam_handle_t *pamh,
 
     status = pam_get_item(pamh, PAM_CONV, (const void **)&conv);
     BAIL_ON_PAM_ERROR(status);
+
+    if (conv == NULL) {
+        status = PAM_CONV_ERR;
+        goto cleanup;
+    }
 
     msg.msg_style = PAM_PROMPT_ECHO_OFF;
     msg.msg = PASSWORD_PROMPT;
@@ -382,10 +478,12 @@ readConfMechOid(int argc,
 {
     int i;
     OM_uint32 major, minor;
-    gss_buffer_desc oidBuf;
     const char *oidstr = NULL;
+#ifndef __APPLE__
     size_t oidstrLen;
+    gss_buffer_desc oidBuf;
     char *p;
+#endif
 
     for (i = 0; i < argc; i++) {
         if (strncmp(argv[i], "mech=", 5) != 0)
@@ -398,6 +496,46 @@ readConfMechOid(int argc,
     if (oidstr == NULL)
         return PAM_SUCCESS;
 
+#ifdef __APPLE__
+    char mechbuf[64];
+    size_t mech_len;
+    heim_oid heimOid;
+    int ret;
+    
+    if (der_parse_heim_oid(oidstr, " .", &heimOid))
+        return PAM_SERVICE_ERR;
+    
+    ret = der_put_oid((unsigned char *)mechbuf + sizeof(mechbuf) - 1,
+                      sizeof(mechbuf),
+                      &heimOid,
+                      &mech_len);
+    if (ret) {
+        der_free_oid(&heimOid);
+        return PAM_SERVICE_ERR;
+    }
+
+    *mech = (gss_OID)malloc(sizeof(gss_OID_desc));
+    if (*mech == NULL) {
+        der_free_oid(&heimOid);
+        return PAM_BUF_ERR;
+    }
+    
+    (*mech)->elements = malloc(mech_len);
+    if ((*mech)->elements == NULL) {
+        der_free_oid(&heimOid);
+        free(*mech);
+        *mech = NULL;
+        return PAM_BUF_ERR;
+    }
+
+    (*mech)->length = mech_len;
+    memcpy((*mech)->elements, mechbuf + sizeof(mechbuf) - mech_len, mech_len);
+
+    der_free_oid(&heimOid);
+
+    major = GSS_S_COMPLETE;
+    minor = 0;
+#else
     oidstrLen = strlen(oidstr);
 
     oidBuf.length = 2 + oidstrLen + 2;
@@ -419,6 +557,7 @@ readConfMechOid(int argc,
     major = gss_str_to_oid(&minor, &oidBuf, mech);
 
     free(oidBuf.value);
+#endif
 
     return pamGssMapStatus(major, minor);
 }
@@ -481,6 +620,9 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
         status = pam_get_item(pamh, PAM_AUTHTOK, (void *)&passwordBuf.value);
         BAIL_ON_PAM_ERROR(status);
 
+        if (passwordBuf.value != NULL)
+            passwordBuf.length = strlen((char *)passwordBuf.value);
+
         status = pamGssAcquireCred(pamh, confFlags, userName, &passwordBuf,
                                    mech, &initiatorCred);
         if (status == PAM_SUCCESS)
@@ -516,7 +658,7 @@ cleanup:
     gss_release_name(&minor, &hostName);
     gss_release_cred(&minor, &initiatorCred);
     gss_release_cred(&minor, &acceptorCred);
-#if 0
+#ifdef __APPLE__
     if (mech != &gss_spnego_mechanism_oid_desc)
         gss_release_oid(&minor, &mech);
 #endif
@@ -547,6 +689,7 @@ pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv)
 
 }
 
+#ifndef __APPLE__
 PAM_EXTERN int
 pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
@@ -571,3 +714,4 @@ pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv)
 cleanup:
     return status;
 }
+#endif /* !__APPLE__ */

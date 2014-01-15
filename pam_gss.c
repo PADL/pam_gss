@@ -634,6 +634,9 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
     if (status != PAM_SUCCESS) {
         isConvPasswordBuf = 1;
 
+        if (flags & PAM_SILENT)
+            goto cleanup;
+
         status = pamGssGetAuthTok(pamh, confFlags, &passwordBuf);
         BAIL_ON_PAM_ERROR(status);
 

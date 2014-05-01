@@ -1,4 +1,7 @@
+# Only if KRB5DIR is not defined do we define it
+ifndef KRB5DIR
 KRB5DIR=/usr/local
+endif
 
 ifeq ($(wildcard /System/Library/Frameworks/GSS.framework),)
 KRB5CFLAGS=$(shell $(KRB5DIR)/bin/krb5-config gssapi --cflags)
@@ -11,6 +14,13 @@ endif
 CFLAGS=-Wall -g $(KRB5CFLAGS)
 LDFLAGS=$(KRB5LIBS) -lpam
 
+# detect whether we're on Linux and on a 64-bit platform
+IS_LINUX_64 := $(shell uname -s)_$(shell uname -p)
+ifeq ($(IS_LINUX_64),Linux_x86_64)
+CFLAGS += -fPIC
+endif
+INSTDIR := $(R)/usr/lib/pam
+
 all: pam_gss.so pamtest
 
 pam_gss.so: pam_gss.o
@@ -22,6 +32,8 @@ pamtest: pamtest.o
 clean:
 	rm -f pam_gss.so pamtest *.o
 
-install:
-	cp pam_gss.so /usr/lib/pam
+install: | $(INSTDIR)
+	cp pam_gss.so $(INSTDIR)/
 
+$(INSTDIR):
+	mkdir -p $(INSTDIR)

@@ -1,0 +1,11 @@
+
+module pam_gss 1.0;
+
+require {
+	type user_home_t;
+	type xdm_t;
+	class file execute;
+}
+
+#============= xdm_t ==============
+allow xdm_t user_home_t:file execute;

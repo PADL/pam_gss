@@ -1,7 +1,7 @@
 Summary: PAM module for GSS-API
 Name: pam_gss
 Version: 6
-Release: 1%{?dist}
+Release: 3%{?dist}
 License: LGPL
 Group: Applications/System
 URL: https://github.com/PADL/pam_gss
@@ -9,9 +9,10 @@ URL: https://github.com/PADL/pam_gss
 %global dist_base pam_gss-master
 
 Source0: https://github.com/PADL/pam_gss/archive/%{dist_base}.zip
-Source1: pam_gss.te
+Source1: gss-auth
+Source2: pam_gss.te
 # Temporary until Luke fixes Makefile
-Source2: Makefile
+Source3: Makefile
 
 BuildRequires: pam-devel, selinux-policy-devel, /usr/share/selinux/devel/policyhelp
 Requires(post):   /usr/sbin/semodule, /sbin/restorecon
@@ -35,9 +36,9 @@ against the MIT Kerberos implementation.
 %prep
 %setup -q -n %{dist_base}
 mkdir SELinux
-cp -p %{SOURCE1} SELinux/
+cp -p %{SOURCE2} SELinux/
 # Note: This is temporary until the Makefile is fixed
-cp -p %{SOURCE2} .
+cp -p %{SOURCE3} .
 
 %build
 # Force compile/link options, extra security for network facing daemon
@@ -56,13 +57,18 @@ cd -
 
 %install
 make install R=$RPM_BUILD_ROOT
-mkdir -p $RPM_BUILD_ROOT/%{_libdir}/security
-mv $RPM_BUILD_ROOT/usr/lib/pam/pam_gss.so $RPM_BUILD_ROOT/%{_libdir}/security/
+# copy the PAM include
+install -d $RPM_BUILD_ROOT/%{_sysconfdir}/pam.d/
+install -m644 %{SOURCE1} $RPM_BUILD_ROOT/%{_sysconfdir}/pam.d/gss-auth
+# copy the PAM module into the right folder
+install -d $RPM_BUILD_ROOT/%{_lib}/security/
+mv $RPM_BUILD_ROOT/usr/lib/pam/pam_gss.so $RPM_BUILD_ROOT/%{_lib}/security/
+# compile the SELinux policy for each policy type
 for selinuxvariant in %{selinux_variants}
 do
-  install -d %{buildroot}%{_datadir}/selinux/${selinuxvariant}
+  install -d $RPM_BUILD_ROOT/%{_datadir}/selinux/${selinuxvariant}
   install -p -m 644 SELinux/pam_gss.pp.${selinuxvariant} \
-    %{buildroot}%{_datadir}/selinux/${selinuxvariant}/pam_gss.pp
+    $RPM_BUILD_ROOT/%{_datadir}/selinux/${selinuxvariant}/pam_gss.pp
 done
 
 %post
@@ -84,13 +90,19 @@ fi
 %defattr(-,root,root)
 
 # the PAM module
-%dir %attr(755,root,root) %{_libdir}/security
-%attr(755,root,root) %{_libdir}/security/pam_gss.so
+%attr(755,root,root) /%{_lib}/security/pam_gss.so
+%attr(644,root,root) %config(noreplace) /etc/pam.d/gss-auth
 %defattr(-,root,root,0755)
 %doc SELinux/*
 %{_datadir}/selinux/*/pam_gss.pp
 
 %changelog
+* Wed May  7 2014 Stefan Paetow <stefan.paetow@ja.net> - 6-3
+- Tweaks to install the binary into the right location.
+
+* Tue May  6 2014 Stefan Paetow <stefan.paetow@ja.net> - 6-2
+- Includes gss-auth file for PAM.
+
 * Fri May  2 2014 Stefan Paetow <stefan.paetow@ja.net> - 6-1
 - Updated to version 6.
 - Includes and installs SELinux policy.

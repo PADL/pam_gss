@@ -67,6 +67,7 @@
 #include <errno.h>
 #include <syslog.h>
 #include <assert.h>
+#include <stdio.h>
 
 #define PASSWORD_PROMPT         "Password:"
 
@@ -250,6 +251,22 @@ readConfFlags(int argc, const char **argv)
     }
 
     return confFlags;
+}
+
+static const char*
+readServiceName(int argc, const char **argv)
+{
+    int i;
+    const char* parameter_name = "service_name=";
+    int parameter_name_len = strlen(parameter_name);
+
+    for (i = 0; i < argc; i++) {
+        if (strncmp(argv[i], parameter_name, parameter_name_len) != 0)
+            continue;
+        return &argv[i][parameter_name_len];
+    }
+
+    return NULL;
 }
 
 static int
@@ -561,11 +578,14 @@ readConfMechOid(int argc,
     return pamGssMapStatus(major, minor);
 }
 
+#define MAX_SERVICE_NAME_LEN    256
+
 int
 pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
     int status, confFlags = 0;
-    char hostNameBufBuf[5 + MAXHOSTNAMELEN + 1] = "host@";
+    char hostNameBufBuf[MAX_SERVICE_NAME_LEN + 1 + MAXHOSTNAMELEN + 1] = "";
+    const char* service_name = NULL;
     int isConvPasswordBuf = 0;
 
     OM_uint32 major, minor;
@@ -580,6 +600,9 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
     gss_OID_set_desc mechOids;
 
     confFlags = readConfFlags(argc, argv);
+    service_name = readServiceName(argc, argv);
+    if (service_name == NULL)
+        service_name = "host";
 
     status = readConfMechOid(argc, argv, &mech);
     BAIL_ON_PAM_ERROR(status);
@@ -595,7 +618,8 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv)
     major = gss_import_name(&minor, &userNameBuf, GSS_C_NT_USER_NAME, &userName);
     BAIL_ON_GSS_ERROR(major, minor);
 
-    if (gethostname(&hostNameBufBuf[5], MAXHOSTNAMELEN) != 0) {
+    snprintf(hostNameBufBuf, MAX_SERVICE_NAME_LEN, "%s@", service_name);
+    if (gethostname(&hostNameBufBuf[strlen(hostNameBufBuf)], MAXHOSTNAMELEN) != 0) {
         status = PAM_SYSTEM_ERR;
         goto cleanup;
     }
